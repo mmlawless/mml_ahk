@@ -1,0 +1,588 @@
+; Teams Status Monitor with MQTT Integration
+; Requirements: 
+; - AutoHotkey v1.1+
+; - mosquitto_pub.exe (MQTT client) in PATH or script directory
+; - Status icon images named: XX_Available.png, XX_Busy.png, XX_DND.png, XX_Away.png, XX_OOO.png, XX_Offline.png
+;   (If none of these are found, status will be set to "Unknown")
+
+#NoEnv
+#SingleInstance Force
+SetWorkingDir %A_ScriptDir%
+
+; Work in screen coordinates (important for multi-monitor setups)
+CoordMode, Pixel, Screen
+CoordMode, Mouse, Screen
+
+; Allow partial title matches (e.g. "Microsoft Teams (work or school)")
+SetTitleMatchMode, 2
+
+; ===== CONFIGURATION =====
+global MQTT_BROKER := "192.168.1.15"
+global MQTT_PORT := "1883"
+global MQTT_TOPIC := "MMLNR/OthTeams"
+global MQTT_USERNAME := ""  ; Leave empty if no authentication needed
+global MQTT_PASSWORD := ""  ; Leave empty if no authentication needed
+global CHECK_INTERVAL := 30000  ; Check every 30 seconds (in milliseconds)
+global DEBUG_MODE := true  ; Set to false to disable debug messages
+global MOSQUITTO_PATH := "C:\Program Files\mosquitto\mosquitto_pub.exe"
+
+; MQTT extra options
+global MQTT_RETAIN := true        ; true = send retained messages (-r)
+global MQTT_JSON_PAYLOAD := true  ; true = send JSON payload instead of plain text
+
+; Teams window title (used only as a fallback; exe detection is primary)
+global TEAMS_WINDOW_TITLE := "Microsoft Teams"
+
+; ===== PERSISTENT CONFIG (.INI) =====
+global INI_PATH := A_ScriptDir . "\TeamsStatusConfig.ini"
+
+; ===== DUAL REGION SUPPORT =====
+; Work (2-monitor) region – YOUR PROVIDED COORDS as defaults
+global Work_SEARCH_X1 := -1902
+global Work_SEARCH_Y1 := 287
+global Work_SEARCH_X2 := -1566
+global Work_SEARCH_Y2 := 485
+
+; Home (3+ monitor) region – defaults to 0, will be set at home via Ctrl+Shift+R
+global Home_SEARCH_X1 := 0
+global Home_SEARCH_Y1 := 0
+global Home_SEARCH_X2 := 0
+global Home_SEARCH_Y2 := 0
+
+; Active region (used by ImageSearch) – will be set by SelectRegionForCurrentSetup()
+global SEARCH_X1 := Work_SEARCH_X1
+global SEARCH_Y1 := Work_SEARCH_Y1
+global SEARCH_X2 := Work_SEARCH_X2
+global SEARCH_Y2 := Work_SEARCH_Y2
+
+; Team members with their initials
+global TeamMembers := []
+TeamMembers.Push({name: "Alexandra Ball", initials: "AB"})
+TeamMembers.Push({name: "Clark Leake-Lyall", initials: "CLL"})
+TeamMembers.Push({name: "Ellis Leake-Lyall", initials: "ELL"})
+TeamMembers.Push({name: "Lorees Arakelian", initials: "LA"})
+TeamMembers.Push({name: "Louaye Nouwayri", initials: "LN"})
+TeamMembers.Push({name: "Tom Ward", initials: "TW"})
+
+; Status types (the ones we actually image-search for)
+global StatusTypes := ["Available", "Busy", "DND", "Away","OOO", "Offline"]
+
+; Status display names (string keys!)
+global StatusDisplayNames := {"Available": "Available"
+                            , "Busy": "Busy"
+                            , "DND": "Do Not Disturb"
+                            , "Away": "Away"
+                            , "Offline": "Offline"
+                            , "OOO": "Out of Office"
+                            , "Unknown": "Unknown"}  ; default/fallback
+
+; ===== LOAD CONFIG FROM INI ON STARTUP =====
+LoadRegionConfig()
+
+; ===== MAIN SCRIPT =====
+; Show startup message
+MsgBox, 64, Teams Status Monitor, Teams Status Monitor Started!`n`nHotkeys:`nCtrl+Shift+T : Manual check`nCtrl+Shift+R : Configure region (saves to WORK/HOME)`nCtrl+Shift+M : Test MQTT`nCtrl+Shift+D : Toggle debug mode`nCtrl+Shift+P : Position Teams window`nCtrl+Shift+Q : Exit`n`nMonitoring every %CHECK_INTERVAL% ms
+
+; Start monitoring on script launch
+Gosub, CheckStatus
+
+; Set up timer for periodic checks
+SetTimer, CheckStatus, %CHECK_INTERVAL%
+return
+
+; ===== HOTKEYS =====
+; Hotkey to manually trigger check (Ctrl+Shift+T)
+^+t::
+    DebugLog("Manual check triggered by user")
+    Gosub, CheckStatus
+return
+
+; Hotkey to configure search region (Ctrl+Shift+R)
+; This now automatically writes to WORK region (<=2 monitors) or HOME region (3+ monitors)
+^+r::
+    SysGet, monCount, MonitorCount
+
+    if (monCount = 2) {
+        profile := "Work"
+        MsgBox, 4, Configure Region (WORK), Two monitors detected.`n`nThis region will be saved as your WORK region.`n`nClick YES, then move the mouse to the TOP-LEFT corner of the Teams status area and press Ctrl+1.
+        IfMsgBox, No
+            return
+    } else if (monCount >= 3) {
+        profile := "Home"
+        MsgBox, 4, Configure Region (HOME), Three or more monitors detected.`n`nThis region will be saved as your HOME region.`n`nClick YES, then move the mouse to the TOP-LEFT corner of the Teams status area and press Ctrl+1.
+        IfMsgBox, No
+            return
+    } else {
+        profile := "Work"
+        MsgBox, 4, Configure Region, Single monitor detected.`n`nThis region will be saved as the WORK profile.`n`nClick YES, then move the mouse to the TOP-LEFT corner of the Teams status area and press Ctrl+1.
+        IfMsgBox, No
+            return
+    }
+
+    KeyWait, Control
+    KeyWait, 1, D
+    MouseGetPos, newX1, newY1
+    ToolTip, Top-Left: %newX1%`, %newY1%
+    Sleep, 1000
+    
+    MsgBox, 4, Configure Region, Now move mouse to BOTTOM-RIGHT corner and press Ctrl+2.
+    IfMsgBox, No
+    {
+        ToolTip
+        return
+    }
+    KeyWait, Control
+    KeyWait, 2, D
+    MouseGetPos, newX2, newY2
+    ToolTip, Region Set: (%newX1%`, %newY1%) to (%newX2%`, %newY2%)
+    Sleep, 2000
+    ToolTip
+
+    if (profile = "Home") {
+        Home_SEARCH_X1 := newX1
+        Home_SEARCH_Y1 := newY1
+        Home_SEARCH_X2 := newX2
+        Home_SEARCH_Y2 := newY2
+        DebugLog("Saved HOME region in memory: X1=" . newX1 . " Y1=" . newY1 . " X2=" . newX2 . " Y2=" . newY2)
+        SaveRegionConfig("Home")
+        MsgBox, Region configured and saved for HOME (3+ monitors)!`nTop-Left: (%newX1%`, %newY1%)`nBottom-Right: (%newX2%`, %newY2%)
+    } else {
+        ; Treat 1 or 2 monitors as WORK profile
+        Work_SEARCH_X1 := newX1
+        Work_SEARCH_Y1 := newY1
+        Work_SEARCH_X2 := newX2
+        Work_SEARCH_Y2 := newY2
+        DebugLog("Saved WORK region in memory: X1=" . newX1 . " Y1=" . newY1 . " X2=" . newX2 . " Y2=" . newY2)
+        SaveRegionConfig("Work")
+        MsgBox, Region configured and saved for WORK (<=2 monitors)!`nTop-Left: (%newX1%`, %newY1%)`nBottom-Right: (%newX2%`, %newY2%)
+    }
+
+    ; Update active region based on the new settings
+    SelectRegionForCurrentSetup()
+return
+
+; Hotkey to toggle debug mode (Ctrl+Shift+D)
+^+d::
+    DEBUG_MODE := !DEBUG_MODE
+    if (DEBUG_MODE)
+        MsgBox, Debug Mode: ON
+    else
+        MsgBox, Debug Mode: OFF
+return
+
+; Hotkey to test MQTT (Ctrl+Shift+M)
+^+m::
+    TestMQTT()
+return
+
+; Hotkey to position Teams automatically based on monitor setup (Ctrl+Shift+P)
+^+p::
+    PositionTeamsAutoDock()
+return
+
+; Ctrl+Shift+Q to exit script
+^+q::
+    MsgBox, 4, Exit, Exit Teams Status Monitor?
+    IfMsgBox Yes
+        ExitApp
+return
+
+; ===== STATUS CHECK ROUTINE =====
+CheckStatus:
+    DebugLog("=== Starting status check ===")
+
+    ; Pick the right region (WORK or HOME) for this monitor layout
+    SelectRegionForCurrentSetup()
+    DebugLog("Using search region: X1=" . SEARCH_X1 . " Y1=" . SEARCH_Y1 . " X2=" . SEARCH_X2 . " Y2=" . SEARCH_Y2)
+
+    teams_id := GetTeamsWindowId()
+    if (!teams_id)
+    {
+        DebugLog("Teams window not found - is Teams running with a visible window?")
+        return
+    }
+
+    ; Check if minimized: -1 = minimized, 0 = normal, 1 = maximized
+    WinGet, minmax, MinMax, ahk_id %teams_id%
+    if (minmax = -1)
+    {
+        DebugLog("Teams is minimized - cannot read pixels. Skipping check.")
+        return
+    }
+
+    ; We DO NOT activate Teams, so your current app keeps focus
+
+    statusData := {}
+    
+    ; Loop through each team member
+    for index, member in TeamMembers {
+        memberName := member.name
+        initials := member.initials
+        
+        DebugLog("Checking status for: " . memberName . " (" . initials . ")")
+        status := DetectStatus(initials, memberName)
+        statusData[memberName] := status
+        
+        DebugLog("  Status detected: " . status)
+        
+        ; Send MQTT message for each member
+        SendMQTT(memberName, status)
+    }
+    
+    ; Show tooltip with current status (currently disabled)
+    DisplayStatus(statusData)
+    DebugLog("=== Status check complete ===`n")
+return
+
+; ===== REGION SELECTION & PERSISTENCE =====
+LoadRegionConfig() {
+    global INI_PATH
+    global Work_SEARCH_X1, Work_SEARCH_Y1, Work_SEARCH_X2, Work_SEARCH_Y2
+    global Home_SEARCH_X1, Home_SEARCH_Y1, Home_SEARCH_X2, Home_SEARCH_Y2
+
+    MsgBox, INI path: %INI_PATH%
+
+    ; Load work region, fallback to current defaults
+    IniRead, Work_SEARCH_X1, %INI_PATH%, Regions, Work_SEARCH_X1, %Work_SEARCH_X1%
+    IniRead, Work_SEARCH_Y1, %INI_PATH%, Regions, Work_SEARCH_Y1, %Work_SEARCH_Y1%
+    IniRead, Work_SEARCH_X2, %INI_PATH%, Regions, Work_SEARCH_X2, %Work_SEARCH_X2%
+    IniRead, Work_SEARCH_Y2, %INI_PATH%, Regions, Work_SEARCH_Y2, %Work_SEARCH_Y2%
+
+    ; Load home region, fallback to current defaults (0s by default)
+    IniRead, Home_SEARCH_X1, %INI_PATH%, Regions, Home_SEARCH_X1, %Home_SEARCH_X1%
+    IniRead, Home_SEARCH_Y1, %INI_PATH%, Regions, Home_SEARCH_Y1, %Home_SEARCH_Y1%
+    IniRead, Home_SEARCH_X2, %INI_PATH%, Regions, Home_SEARCH_X2, %Home_SEARCH_X2%
+    IniRead, Home_SEARCH_Y2, %INI_PATH%, Regions, Home_SEARCH_Y2, %Home_SEARCH_Y2%
+
+    DebugLog("Loaded WORK region from INI: X1=" . Work_SEARCH_X1 . " Y1=" . Work_SEARCH_Y1 . " X2=" . Work_SEARCH_X2 . " Y2=" . Work_SEARCH_Y2)
+    DebugLog("Loaded HOME region from INI: X1=" . Home_SEARCH_X1 . " Y1=" . Home_SEARCH_Y1 . " X2=" . Home_SEARCH_X2 . " Y2=" . Home_SEARCH_Y2)
+}
+
+SaveRegionConfig(profile) {
+    global INI_PATH
+    global Work_SEARCH_X1, Work_SEARCH_Y1, Work_SEARCH_X2, Work_SEARCH_Y2
+    global Home_SEARCH_X1, Home_SEARCH_Y1, Home_SEARCH_X2, Home_SEARCH_Y2
+
+    if (profile = "Home") {
+        IniWrite, %Home_SEARCH_X1%, %INI_PATH%, Regions, Home_SEARCH_X1
+        IniWrite, %Home_SEARCH_Y1%, %INI_PATH%, Regions, Home_SEARCH_Y1
+        IniWrite, %Home_SEARCH_X2%, %INI_PATH%, Regions, Home_SEARCH_X2
+        IniWrite, %Home_SEARCH_Y2%, %INI_PATH%, Regions, Home_SEARCH_Y2
+        DebugLog("Saved HOME region to INI.")
+    } else {
+        ; Treat anything else as WORK
+        IniWrite, %Work_SEARCH_X1%, %INI_PATH%, Regions, Work_SEARCH_X1
+        IniWrite, %Work_SEARCH_Y1%, %INI_PATH%, Regions, Work_SEARCH_Y1
+        IniWrite, %Work_SEARCH_X2%, %INI_PATH%, Regions, Work_SEARCH_X2
+        IniWrite, %Work_SEARCH_Y2%, %INI_PATH%, Regions, Work_SEARCH_Y2
+        DebugLog("Saved WORK region to INI.")
+    }
+}
+
+SelectRegionForCurrentSetup() {
+    global SEARCH_X1, SEARCH_Y1, SEARCH_X2, SEARCH_Y2
+    global Work_SEARCH_X1, Work_SEARCH_Y1, Work_SEARCH_X2, Work_SEARCH_Y2
+    global Home_SEARCH_X1, Home_SEARCH_Y1, Home_SEARCH_X2, Home_SEARCH_Y2
+
+    SysGet, monCount, MonitorCount
+
+    if (monCount = 2) {
+        ; WORK setup
+        SEARCH_X1 := Work_SEARCH_X1
+        SEARCH_Y1 := Work_SEARCH_Y1
+        SEARCH_X2 := Work_SEARCH_X2
+        SEARCH_Y2 := Work_SEARCH_Y2
+        DebugLog("SelectRegion: WORK profile chosen (2 monitors).")
+    } else if (monCount >= 3 && Home_SEARCH_X1 != 0 && Home_SEARCH_X2 != 0) {
+        ; HOME setup, only if region has been configured
+        SEARCH_X1 := Home_SEARCH_X1
+        SEARCH_Y1 := Home_SEARCH_Y1
+        SEARCH_X2 := Home_SEARCH_X2
+        SEARCH_Y2 := Home_SEARCH_Y2
+        DebugLog("SelectRegion: HOME profile chosen (3+ monitors).")
+    } else {
+        ; Fallback to WORK if HOME not configured or single monitor
+        SEARCH_X1 := Work_SEARCH_X1
+        SEARCH_Y1 := Work_SEARCH_Y1
+        SEARCH_X2 := Work_SEARCH_X2
+        SEARCH_Y2 := Work_SEARCH_Y2
+        DebugLog("SelectRegion: Fallback to WORK profile.")
+    }
+}
+
+; ===== FUNCTIONS =====
+
+; --- Robust Teams window finder ---
+GetTeamsWindowId() {
+    global TEAMS_WINDOW_TITLE
+
+    ; Try new Teams exe
+    WinGet, id, ID, ahk_exe ms-teams.exe
+    if (id != "")
+        return id
+
+    ; Try classic Teams exe
+    WinGet, id, ID, ahk_exe Teams.exe
+    if (id != "")
+        return id
+
+    ; Fallback: partial title match
+    WinGet, id, ID, %TEAMS_WINDOW_TITLE%
+    return id
+}
+
+DetectStatus(initials, memberName) {
+    global SEARCH_X1, SEARCH_Y1, SEARCH_X2, SEARCH_Y2
+
+    ; Search for each status icon for this specific team member
+    for index, statusType in StatusTypes {
+        iconFile := initials . "_" . statusType . ".png"
+        
+        DebugLog("  Searching for: " . iconFile)
+        
+        ; Check if file exists first
+        IfNotExist, %iconFile%
+        {
+            DebugLog("  WARNING: Icon file not found: " . iconFile)
+            continue
+        }
+        
+        ; ImageSearch with tolerance of 50 (adjust if needed)
+        ImageSearch, foundX, foundY
+            , %SEARCH_X1%, %SEARCH_Y1%, %SEARCH_X2%, %SEARCH_Y2%
+            , *50 %iconFile%
+        
+        if (ErrorLevel = 0) {
+            DebugLog("  FOUND at coordinates: (" . foundX . ", " . foundY . ")")
+            return statusType
+        } else {
+            DebugLog("  Not found (ErrorLevel: " . ErrorLevel . ")")
+        }
+    }
+    
+    ; Default to Unknown if no icon found
+    DebugLog("  No status icon found, defaulting to Unknown")
+    return "Unknown"
+}
+
+SendMQTT(memberName, status) {
+    statusName := StatusDisplayNames[status]
+    if (statusName = "")
+        statusName := status  ; fallback if key lookup fails
+    
+    ; Choose payload format
+    if (MQTT_JSON_PAYLOAD) {
+        ; JSON payload: {"name":"Alexandra Ball","status":"Available"}
+        message := "{""name"": """ . memberName . """, ""status"": """ . statusName . """}"
+    } else {
+        ; Plain-text format
+        message := memberName . " - " . statusName
+    }
+    
+    ; Create sanitized topic name (replace spaces with underscores)
+    sanitizedName := StrReplace(memberName, " ", "_")
+    topic := MQTT_TOPIC . "/" . sanitizedName
+    
+    DebugLog("Sending MQTT: Topic=" . topic . ", Message=" . message)
+    
+    ; Check if mosquitto_pub.exe exists at specified path
+    IfNotExist, %MOSQUITTO_PATH%
+    {
+        DebugLog("ERROR: mosquitto_pub.exe not found at: " . MOSQUITTO_PATH)
+        MsgBox, 16, Error, mosquitto_pub.exe not found at:`n%MOSQUITTO_PATH%`n`nPlease check the MOSQUITTO_PATH variable in the script.
+        return
+    }
+    
+    DebugLog("mosquitto_pub.exe found at: " . MOSQUITTO_PATH)
+    
+    ; Build authentication parameters if needed
+    authParams := ""
+    if (MQTT_USERNAME != "") {
+        authParams := " -u """ . MQTT_USERNAME . """"  ; include leading space
+        if (MQTT_PASSWORD != "") {
+            authParams .= " -P """ . MQTT_PASSWORD . """" 
+        }
+    }
+    
+    ; Retain flag
+    retainFlag := MQTT_RETAIN ? " -r" : ""
+    
+    ; Build message argument: use -f for JSON (to avoid quoting issues), -m for plain text
+    if (MQTT_JSON_PAYLOAD) {
+        payloadFile := A_Temp . "\teams_status_payload.json"
+        FileDelete, %payloadFile%
+        FileAppend, %message%, %payloadFile%
+        msgArg := " -f """ . payloadFile . """"      ; mosquitto_pub will read payload from file
+    } else {
+        msgArg := " -m """ . message . """"          ; simple text payload
+    }
+    
+    ; Send to individual topic
+    cmd := """" . MOSQUITTO_PATH . """ -h " . MQTT_BROKER . " -p " . MQTT_PORT 
+        . authParams . " -t """ . topic . """" . msgArg . retainFlag
+    DebugLog("Executing command (individual topic): " . cmd)
+    
+    RunWait, %cmd%, , Hide
+    DebugLog("ErrorLevel after publish to individual topic: " . ErrorLevel)
+    
+    if (ErrorLevel != 0) {
+        DebugLog("ERROR: MQTT publish failed for individual topic")
+    } else {
+        DebugLog("SUCCESS: Published to " . topic)
+    }
+}
+
+TestMQTT() {
+    DebugLog("=== MQTT Test Started ===")
+    
+    ; Test 1: Check if file exists
+    IfExist, %MOSQUITTO_PATH%
+    {
+        DebugLog("TEST 1 PASS: mosquitto_pub.exe found")
+        MsgBox, TEST 1 PASS: mosquitto_pub.exe found at:`n%MOSQUITTO_PATH%
+    } else {
+        DebugLog("TEST 1 FAIL: mosquitto_pub.exe not found")
+        MsgBox, 16, Test Failed, TEST 1 FAIL: mosquitto_pub.exe not found at:`n%MOSQUITTO_PATH%
+        return
+    }
+    
+    ; Build authentication parameters if needed
+    authParams := ""
+    if (MQTT_USERNAME != "") {
+        authParams := " -u """ . MQTT_USERNAME . """" 
+        if (MQTT_PASSWORD != "") {
+            authParams .= " -P """ . MQTT_PASSWORD . """" 
+        }
+    }
+    
+    ; Test 2: Try a simple MQTT publish (plain text, not JSON)
+    testTopic := MQTT_TOPIC . "/test"
+    testMessage := "Test message from AutoHotkey at " . A_Now
+    cmd := """" . MOSQUITTO_PATH . """ -h " . MQTT_BROKER . " -p " . MQTT_PORT 
+        . authParams . " -t """ . testTopic . """ -m """ . testMessage . """ -d"
+    
+    DebugLog("TEST 2: Executing test command")
+    DebugLog("Command: " . cmd)
+    MsgBox, Sending test MQTT message...`n`nBroker: %MQTT_BROKER%:%MQTT_PORT%`nTopic: %testTopic%`nMessage: %testMessage%
+    
+    RunWait, %cmd%, , Hide
+    DebugLog("ErrorLevel after test publish: " . ErrorLevel)
+    
+    if (ErrorLevel = 0) {
+        DebugLog("TEST 2 PASS: MQTT publish successful")
+        MsgBox, 64, Test Passed, TEST 2 PASS: MQTT command executed successfully!`n`nTopic: %testTopic%`nMessage: %testMessage%`n`nCheck your MQTT broker/subscriber to verify the message was received.
+    } else {
+        DebugLog("TEST 2 FAIL: MQTT publish failed")
+        MsgBox, 16, Test Failed, TEST 2 FAIL: MQTT publish command failed`n`nErrorLevel: %ErrorLevel%`n`nPossible issues:`n- Broker not accessible at %MQTT_BROKER%:%MQTT_PORT%`n- Firewall blocking connection`n- Authentication required (check MQTT_USERNAME/PASSWORD)`n- Broker not running
+    }
+    
+    DebugLog("=== MQTT Test Complete ===")
+}
+
+DisplayStatus(statusData) {
+    ; Currently disabled tooltip, but kept structure in case you re-enable later
+    /*
+    tooltipText := "Teams Status Monitor`n" . "========================`n"
+    
+    for member, status in statusData {
+        statusName := StatusDisplayNames[status]
+        if (statusName = "")
+            statusName := status
+        tooltipText .= member . ": " . statusName . "`n"
+    }
+    
+    tooltipText .= "`nLast updated: " . A_Hour . ":" . A_Min . ":" . A_Sec
+    tooltipText .= "`nDebug Mode: " . (DEBUG_MODE ? "ON" : "OFF")
+    
+    ToolTip, %tooltipText%, 10, 10
+    SetTimer, RemoveToolTip, 5000
+    */
+}
+
+RemoveToolTip:
+    SetTimer, RemoveToolTip, Off
+    ToolTip
+return
+
+DebugLog(message) {
+    if (DEBUG_MODE) {
+        ; Append to debug log file with timestamp
+        FormatTime, timestamp, , yyyy-MM-dd HH:mm:ss
+        logMessage := timestamp . " - " . message . "`n"
+        FileAppend, %logMessage%, 004 AHK Output Teams OthersStatus MQTT.log
+        
+        ; Also output to debugger if available
+        OutputDebug, %logMessage%
+    }
+}
+
+; ===== TEAMS POSITIONING (AUTO-DOCK LEFT/RIGHT BY PHYSICAL POSITION) =====
+; Uses screen coordinates to find leftmost/rightmost monitors.
+PositionTeamsAutoDock() {
+    teams_id := GetTeamsWindowId()
+    if (!teams_id)
+    {
+        MsgBox, 16, Error, Teams window not found.`nMake sure Microsoft Teams is running with a visible window.
+        return
+    }
+
+    SysGet, monCount, MonitorCount
+    if (monCount < 1) {
+        MsgBox, 16, Error, No monitors detected. Aborting.
+        return
+    }
+
+    ; Find leftmost and rightmost monitors by coordinates
+    minLeft :=  2147483647   ; big positive
+    maxRight := -2147483648  ; big negative
+    leftIndex  := 1
+    rightIndex := 1
+
+    Loop, %monCount%
+    {
+        i := A_Index
+        SysGet, mon, Monitor, %i%  ; monLeft, monTop, monRight, monBottom
+
+        if (monLeft < minLeft) {
+            minLeft := monLeft
+            leftIndex := i
+        }
+        if (monRight > maxRight) {
+            maxRight := monRight
+            rightIndex := i
+        }
+    }
+
+    ; Decide which monitor and which side based on count
+    if (monCount = 1) {
+        ; Single monitor: use right side of the only screen
+        monIndex := leftIndex   ; same as rightIndex here
+        side := "right"
+    } else if (monCount = 2) {
+        ; Work setup (2 monitors): left side of leftmost physical monitor
+        monIndex := leftIndex
+        side := "left"
+    } else {
+        ; Home setup (3+ monitors): right side of rightmost physical monitor
+        monIndex := rightIndex
+        side := "right"
+    }
+
+    SysGet, mon, Monitor, %monIndex%  ; gives monLeft, monTop, monRight, monBottom
+
+    winWidth  := 400
+    winHeight := monBottom - monTop
+
+    if (side = "left") {
+        x := monLeft              ; dock on left edge of that monitor
+    } else {
+        x := monRight - winWidth  ; dock on right edge of that monitor
+    }
+    y := monTop
+
+    WinRestore, ahk_id %teams_id%       ; ensure not minimized
+    WinMove, ahk_id %teams_id%, , %x%, %y%, %winWidth%, %winHeight%
+    WinSet, AlwaysOnTop, On, ahk_id %teams_id%
+
+    MsgBox, 64, Teams Positioned, Teams has been positioned on the %side% side of monitor %monIndex% and set AlwaysOnTop.`n`nMonitor count: %monCount%`nLeftmost index: %leftIndex%`nRightmost index: %rightIndex%.
+}
