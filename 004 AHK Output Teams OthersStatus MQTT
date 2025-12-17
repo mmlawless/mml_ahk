@@ -2,7 +2,7 @@
 ; Requirements: 
 ; - AutoHotkey v1.1+
 ; - mosquitto_pub.exe (MQTT client) in PATH or script directory
-; - Status icon images named: XX_Available.png, XX_Busy.png, XX_DND.png, XX_Away.png, XX_OOO.png, XX_Offline.png
+; - Status icon images named: XX_Available.png, XX_Busy.png, XX_DND.png, XX_Away.png, XX_OOO.png, XX_BOOO.png, XX_Offline.png
 ;   (If none of these are found, status will be set to "Unknown")
 
 #NoEnv
@@ -65,7 +65,7 @@ TeamMembers.Push({name: "Louaye Nouwayri", initials: "LN"})
 TeamMembers.Push({name: "Tom Ward", initials: "TW"})
 
 ; Status types (the ones we actually image-search for)
-global StatusTypes := ["Available", "Busy", "DND", "Away","OOO", "Offline"]
+global StatusTypes := ["Available", "Busy", "DND", "Away","OOO", "BOOO", "Offline"]
 
 ; Status display names (string keys!)
 global StatusDisplayNames := {"Available": "Available"
@@ -74,6 +74,7 @@ global StatusDisplayNames := {"Available": "Available"
                             , "Away": "Away"
                             , "Offline": "Offline"
                             , "OOO": "Out of Office"
+                            , "BOOO": "Busy Out of Office"
                             , "Unknown": "Unknown"}  ; default/fallback
 
 ; ===== LOAD CONFIG FROM INI ON STARTUP =====
